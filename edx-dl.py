@@ -37,6 +37,10 @@ import json
 import os
 import re
 import sys
+import netrc
+import textwrap
+
+from optparse import OptionParser
 
 from bs4 import BeautifulSoup
 
@@ -45,6 +49,22 @@ LOGIN_API = 'https://www.edx.org/login'
 DASHBOARD = 'https://www.edx.org/dashboard'
 YOUTUBE_VIDEO_ID_LENGTH = 11
 
+ROWS = 24
+COLS = 80
+
+class Defaults(object):
+    def __init__(self):
+        self.netrc_file = None
+        self.user_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.6; rv:18.0) Gecko/20100101 Firefox/18.0"
+
+def set_terminal_size():
+    global ROWS, COLS
+    rows, cols = os.popen('stty size', 'r').read().split()
+    ROWS = int(rows)
+    COLS = int(cols)
+
+def printscr(msg):
+    print('\n'.join(textwrap.wrap(msg, COLS)))
 
 def get_initial_token():
     """
@@ -74,13 +94,175 @@ def get_page_contents(url, headers):
     result = urlopen(Request(url, None, headers))
     return result.read()
 
+def get_email_paswd(options, args):
+    if len(args) != 2:
+        if not options.netrc_file:
+            printscr("You need to specify either a netrc file or a " \
+                     "username/password.")
+            sys.exit(2)
+        else:
+            try:
+                netinfo = netrc.netrc(options.netrc_file)
+                user_email, dummy, user_pswd = netinfo.authenticators('edx-dl')
+            except Exception, err:
+                printscr("The netrc file you specified could not be read.")
+                printscr(str(err))
+                sys.exit(2)
+    else:
+        user_email = args[0]
+        user_pswd  = args[1]
 
+    return (user_email, user_pswd)
+
+def main(argv):
+    """main application entry point"""
+    defaults = Defaults()
+
+    usage = "%s [options] [<username> <password>]" % argv[0]
+    description = "Download edX course videos."
+
+    parser = OptionParser(usage=usage, description=description)
+
+    parser.add_option("-n", "--netrc", dest="netrc_file",
+            default=defaults.netrc_file,
+            help="set the netrc file (default: %default)",
+            metavar="NETRC_FILE")
+
+    parser.add_option("-u", "--user-agent", dest="user_agent",
+            default=defaults.user_agent,
+            help="set the User-Agent (default: %default)",
+            metavar="USER_AGENT")
+    try:
+        options, args = parser.parse_args(argv[1:])
+    except Exception, err:
+        printscr("Error: %s" % str(err))
+        return 2
+
+    user_email, user_pswd = get_email_paswd(options, args)
+
+    # Prepare Headers
+    headers = {
+        'User-Agent': options.user_agent,
+        'Accept': 'application/json, text/javascript, */*; q=0.01',
+        'Content-Type': 'application/x-www-form-urlencoded;charset=utf-8',
+        'Referer': EDX_HOMEPAGE,
+        'X-Requested-With': 'XMLHttpRequest',
+        'X-CSRFToken': get_initial_token(),
+        }
+
+    # Login
+    post_data = urlencode({'email': user_email,
+                           'password': user_pswd,
+                           'remember': False}).encode('utf-8')
+    request = Request(LOGIN_API, post_data, headers)
+    response = urlopen(request)
+    resp = json.loads(response.read().decode('utf-8'))
+    if not resp.get('success', False):
+        printscr("The email and/or password you supplied does not appear " \
+                 "to be correct.")
+        sys.exit(2)
+
+    # Get user info/courses
+    dash = get_page_contents(DASHBOARD, headers)
+    soup = BeautifulSoup(dash)
+    data = soup.find_all('ul')[1]
+    USERNAME = data.find_all('span')[1].string
+    USEREMAIL = data.find_all('span')[3].string
+    COURSES = soup.find_all('article', 'my-course')
+    courses = []
+    for COURSE in COURSES:
+        c_name = COURSE.h3.string
+        c_link = 'https://www.edx.org' + COURSE.a['href']
+        if c_link.endswith('info') or c_link.endswith('info/'):
+            state = 'Started'
+        else:
+            state = 'Not yet'
+        courses.append((c_name, c_link, state))
+    numOfCourses = len(courses)
+
+    # Welcome and Choose Course
+
+    print('Welcome %s' % USERNAME)
+    print('You can access %d courses on edX' % numOfCourses)
+
+    c = 0
+    for course in courses:
+        c += 1
+        print('%d - %s -> %s' % (c, course[0], course[2]))
+
+    c_number = int(input('Enter Course Number: '))
+    while c_number > numOfCourses or courses[c_number - 1][2] != 'Started':
+        print('Enter a valid Number for a Started Course ! between 1 and ', \
+            numOfCourses)
+        c_number = int(input('Enter Course Number: '))
+    selected_course = courses[c_number - 1]
+    COURSEWARE = selected_course[1].replace('info', 'courseware')
+
+    ## Getting Available Weeks
+    courseware = get_page_contents(COURSEWARE, headers)
+    soup = BeautifulSoup(courseware)
+    data = soup.section.section.div.div.nav
+    WEEKS = data.find_all('div')
+    weeks = [(w.h3.a.string, ['https://www.edx.org' + a['href'] for a in
+             w.ul.find_all('a')]) for w in WEEKS]
+    numOfWeeks = len(weeks)
+
+    # Choose Week or choose all
+    print('%s has %d weeks so far' % (selected_course[0], numOfWeeks))
+    w = 0
+    for week in weeks:
+        w += 1
+        print('%d - Download %s videos' % (w, week[0]))
+    print('%d - Download them all' % (numOfWeeks + 1))
+
+    w_number = int(input('Enter Your Choice: '))
+    while w_number > numOfWeeks + 1:
+        print('Enter a valid Number between 1 and %d' % (numOfWeeks + 1))
+        w_number = int(input('Enter Your Choice: '))
+
+    if w_number == numOfWeeks + 1:
+        links = [link for week in weeks for link in week[1]]
+    else:
+        links = weeks[w_number - 1][1]
+
+
+    video_id = []
+    for link in links:
+        print("Processing '%s'..." % link)
+        page = get_page_contents(link, headers)
+        splitter = re.compile(b'data-streams=(?:&#34;|").*1.0[0]*:')
+        id_container = splitter.split(page)[1:]
+        video_id += [link[:YOUTUBE_VIDEO_ID_LENGTH] for link in
+                     id_container]
+
+    video_link = ['http://youtube.com/watch?v=' + v_id.decode("utf-8") for v_id in video_id]
+
+    # Get Available Video_Fmts
+    os.system('youtube-dl -F %s' % video_link[-1])
+    video_fmt = int(input('Choose Format code: '))
+
+    # Get subtitles
+    subtitles = input('Download subtitles (y/n)? ') == 'y'
+        
+    # Download Videos
+    c = 0
+    for v in video_link:
+        c += 1
+        cmd = 'youtube-dl -o "Downloaded/' + selected_course[0] + '/' + str(c).zfill(2) + '-%(title)s.%(ext)s" -f ' + str(video_fmt)
+        if(subtitles):
+            cmd += ' --write-srt'
+        cmd += ' ' + str(v)
+        os.system(cmd)
+
+    # Say Good Bye :)
+    print('Videos have been downloaded, thanks for using our tool, Good Bye :)')
 if __name__ == '__main__':
-    if len(sys.argv) != 3:
+    set_terminal_size()
+    try:
+        sys.exit(main(sys.argv))
+    except KeyboardInterrupt, ki:
+        print("\nReceived ctrl-c; we're done.")
         sys.exit(1)
-
-    user_email = sys.argv[1]
-    user_pswd = sys.argv[2]
 
     # Prepare Headers
     headers = {
